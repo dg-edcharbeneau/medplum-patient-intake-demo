@@ -36,6 +36,7 @@ export async function handler(_medplum: MedplumClient, event: BotEvent<Parameter
   const formState = getParam('formState') ?? '{}';
   const history = safeParseArray(getParam('history'));
   const userMessage = getParam('userMessage') ?? '';
+  const asking = getParam('asking') ?? ''; // linkId the assistant's previous question targeted
 
   const region = event.secrets['AWS_REGION']?.valueString ?? DEFAULT_REGION;
   const accessKeyId = event.secrets['AWS_ACCESS_KEY_ID']?.valueString;
@@ -51,7 +52,12 @@ export async function handler(_medplum: MedplumClient, event: BotEvent<Parameter
     ...history
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
       .map((m) => ({ role: m.role, content: [{ text: String(m.content) }] })),
-    { role: 'user', content: [{ text: `USER_DATA: ${formState}\nUSER_REQUEST: ${userMessage}` }] },
+    {
+      role: 'user',
+      content: [
+        { text: `USER_DATA: ${formState}\nASKED_FIELD: ${asking || 'none'}\nUSER_REQUEST: ${userMessage}` },
+      ],
+    },
   ];
 
   const requestBody = JSON.stringify({
@@ -76,6 +82,7 @@ export async function handler(_medplum: MedplumClient, event: BotEvent<Parameter
     { name: 'updates', valueString: JSON.stringify(parsed.updates ?? {}) },
     { name: 'clear', valueString: JSON.stringify(parsed.clear ?? []) },
     { name: 'submit', valueString: String(Boolean(parsed.submit)) },
+    { name: 'asking', valueString: typeof parsed.asking === 'string' ? parsed.asking : '' },
   ];
 
   return { resourceType: 'Parameters', parameter };
@@ -88,18 +95,23 @@ function buildSystemPrompt(schema: string): string {
     '- You are helping a patient complete a medical intake. Assist them in a warm, natural conversation.',
     `- The form fields are described by this JSON schema: ${schema}`,
     '- USER_DATA (sent with each request) is the data collected so far.',
+    '- ASKED_FIELD (sent with each request) is the linkId your previous question was asking about ("none" at the start).',
+    '- A short or bare answer (e.g. just a name, number, or date) answers the ASKED_FIELD. Map it to that exact linkId — do NOT put it in a different field such as first-name unless the patient clearly names another field.',
     '- Each time the patient provides information that maps to one or more fields, set those fields.',
     '- Convert any dates the patient gives to yyyy-MM-dd format.',
     '- For a choice field, the value MUST be one of that field\'s allowed option values; if the reply does not match, ask them to clarify.',
+    '- Always handle the patient\'s latest message first: if they correct, change, or revisit ANY field — even one answered earlier or a different field than the one you just asked about — honor it this turn before moving on.',
+    '- To correct or change a value, put the NEW value in "updates" (this overwrites the old one). Do NOT re-ask for a field the patient just answered or corrected.',
+    '- Use "clear" ONLY when the patient wants to remove or blank a field without giving a replacement. Never clear a field you are also setting in "updates".',
     '- Guide the patient by asking about missing data WITHOUT revealing they are filling out a form.',
     '- Ask about only one item at a time.',
-    '- Briefly acknowledge what you captured, then ask the next question. Keep replies short and natural — they may be spoken aloud.',
-    '- If the patient wants to change or remove something, clear those fields.',
+    '- Briefly acknowledge what you captured or changed, then ask the next question. Keep replies short and natural — they may be spoken aloud.',
     '- When all required fields have values, summarize briefly and ask if they would like to submit.',
     '- Set submit=true only after the patient confirms they want to submit.',
     'Respond with ONLY minified JSON, no prose and no code fences, in exactly this shape:',
-    '{"updates":{"<linkId>":<value>},"clear":["<linkId>"],"assistantMessage":"<what to say next>","submit":<true|false>}',
+    '{"updates":{"<linkId>":<value>},"clear":["<linkId>"],"assistantMessage":"<what to say next>","submit":<true|false>,"asking":"<linkId>"}',
     '- Put in "updates" only the fields you are setting this turn (omit the rest). Use each choice field\'s allowed option value.',
+    '- Set "asking" to the linkId your assistantMessage is asking the patient about (empty string if you are not asking for a field). This is echoed back next turn as ASKED_FIELD.',
     '- "clear" and "submit" are optional; use [] and false when nothing applies.',
   ].join('\n');
 }
@@ -204,6 +216,7 @@ interface AgentResult {
   clear?: string[];
   assistantMessage?: string;
   submit?: boolean;
+  asking?: string;
 }
 
 interface HistoryTurn {

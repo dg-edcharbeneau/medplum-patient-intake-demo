@@ -47,6 +47,8 @@ export interface UseIntakeChat {
   readonly pending: boolean;
   readonly error: string | undefined;
   readonly progress: { current: number; total: number };
+  /** linkIds the agent set this turn (for scroll-to + highlight). A new array each turn. */
+  readonly lastUpdated: string[];
   /** Every required field has a value. */
   readonly isComplete: boolean;
   /** The agent asked to submit (after the patient confirmed). */
@@ -66,6 +68,7 @@ export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
   const botIdRef = useRef<string | undefined>(undefined);
   const answerCache = useRef<Map<string, QuestionnaireResponseItemAnswer>>(new Map());
   const msgCounter = useRef(0);
+  const askingRef = useRef(''); // linkId the agent's last question targeted; echoed back each turn
 
   const [ready, setReady] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -76,6 +79,7 @@ export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
   const [submitRequested, setSubmitRequested] = useState(false);
   const [filledCount, setFilledCount] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<string[]>([]);
 
   // Build the flattened form schema once (expands choice value sets).
   useEffect(() => {
@@ -130,7 +134,11 @@ export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
     async (userMessage: string, opener: boolean): Promise<{ speak: string; done: boolean }> => {
       try {
         const botId = await resolveBotId();
-        const history = messagesRef.current.slice(-20).map((m) => ({ role: m.role, content: m.text }));
+        // The current user message is passed separately as `userMessage`; drop it from history
+        // (submitUserMessage appends it before calling runTurn) so the model doesn't see the same
+        // turn twice / two user turns in a row.
+        const prior = opener ? [] : messagesRef.current.slice(0, -1);
+        const history = prior.slice(-20).map((m) => ({ role: m.role, content: m.text }));
         const params: Parameters = {
           resourceType: 'Parameters',
           parameter: [
@@ -138,6 +146,7 @@ export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
             { name: 'formState', valueString: JSON.stringify(formStateRef.current) },
             { name: 'history', valueString: JSON.stringify(opener ? [] : history) },
             { name: 'userMessage', valueString: userMessage },
+            { name: 'asking', valueString: opener ? '' : askingRef.current },
           ],
         };
         const result = (await medplum.executeBot(botId, params, ContentType.FHIR_JSON)) as Parameters;
@@ -146,18 +155,22 @@ export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
         const updates = safeParseObject(getResultParam(result, 'updates'));
         const clear = safeParseStringArray(getResultParam(result, 'clear'));
         const submit = getResultParam(result, 'submit') === 'true';
+        askingRef.current = getResultParam(result, 'asking') ?? '';
 
         // Apply updates/clears to the working form state.
         const next = { ...formStateRef.current };
+        const changed: string[] = [];
         for (const [k, v] of Object.entries(updates)) {
           if (schemaRef.current.some((f) => f.linkId === k)) {
             next[k] = v;
+            changed.push(k);
           }
         }
         for (const k of clear) {
           delete next[k];
         }
         formStateRef.current = next;
+        setLastUpdated(changed);
 
         if (assistantMessage) {
           addMessage('assistant', assistantMessage);
@@ -217,6 +230,7 @@ export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
     pending,
     error,
     progress: { current: filledCount, total: schemaRef.current.length },
+    lastUpdated,
     isComplete,
     submitRequested,
     start,

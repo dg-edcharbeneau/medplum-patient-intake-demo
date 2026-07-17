@@ -70,12 +70,34 @@ function IntakeChat(): JSX.Element {
   const [input, setInput] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const formViewportRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const started = voice.messages.length > 0;
 
   // Auto-scroll the transcript.
   useEffect(() => {
     viewportRef.current?.scrollTo({ top: viewportRef.current.scrollHeight, behavior: 'smooth' });
   }, [voice.messages, voice.partialTranscript]);
+
+  // When the agent sets fields, scroll the form to the first one and briefly highlight them.
+  useEffect(() => {
+    const linkIds = voice.lastUpdated;
+    const container = formViewportRef.current;
+    if (linkIds.length === 0 || !container) {
+      return undefined;
+    }
+    // The form remounts on version change; wait a frame so the new inputs are in the DOM.
+    const raf = requestAnimationFrame(() => {
+      const fields = linkIds
+        .map((linkId) => findField(container, linkId))
+        .filter((el): el is HTMLElement => el !== null);
+      if (fields.length > 0) {
+        scrollWithin(container, fields[0]);
+        fields.forEach(pulseHighlight);
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [voice.lastUpdated]);
 
   // Stop mic/audio when leaving the page.
   useEffect(() => {
@@ -89,7 +111,11 @@ function IntakeChat(): JSX.Element {
       return;
     }
     setInput('');
-    voice.sendText(value).catch((err) => showError(normalizeErrorString(err)));
+    voice
+      .sendText(value)
+      .catch((err) => showError(normalizeErrorString(err)))
+      // Keep focus in the input so the patient can keep typing without reaching for the mouse.
+      .finally(() => inputRef.current?.focus());
   };
 
   const submittedRef = useRef(false);
@@ -244,10 +270,11 @@ function IntakeChat(): JSX.Element {
                     )
                   )}
                   <TextInput
+                    ref={inputRef}
                     style={{ flex: 1 }}
                     placeholder="Type your answer…"
                     value={input}
-                    disabled={voice.pending || voice.isComplete}
+                    disabled={submitting || voice.submitRequested}
                     onChange={(e) => setInput(e.currentTarget.value)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
@@ -258,7 +285,7 @@ function IntakeChat(): JSX.Element {
                   <ActionIcon
                     variant="filled"
                     size="lg"
-                    disabled={voice.pending || voice.isComplete || !input.trim()}
+                    disabled={voice.pending || submitting || voice.submitRequested || !input.trim()}
                     onClick={() => handleSend(input)}
                     title="Send"
                   >
@@ -285,7 +312,7 @@ function IntakeChat(): JSX.Element {
                   Submit
                 </Button>
               </Group>
-              <ScrollArea style={{ flex: 1 }} type="auto">
+              <ScrollArea viewportRef={formViewportRef} style={{ flex: 1 }} type="auto">
                 <QuestionnaireForm
                   key={voice.version}
                   questionnaire={questionnaire!}
@@ -303,4 +330,34 @@ function IntakeChat(): JSX.Element {
 
 function showError(message: string): void {
   showNotification({ color: 'red', title: 'Error', message });
+}
+
+/** Find the field wrapper for a given linkId. Medplum sets id/name={linkId} on the input control. */
+function findField(container: HTMLElement, linkId: string): HTMLElement | null {
+  const esc = linkId.replace(/["\\]/g, '\\$&');
+  const control = container.querySelector<HTMLElement>(`[id="${esc}"], [name="${esc}"]`);
+  if (!control) {
+    return null;
+  }
+  return control.closest<HTMLElement>('.mantine-InputWrapper-root') ?? control;
+}
+
+/** Smooth-scroll the field to the vertical center of its own scroll container (not the page). */
+function scrollWithin(container: HTMLElement, el: HTMLElement): void {
+  const c = container.getBoundingClientRect();
+  const e = el.getBoundingClientRect();
+  const delta = e.top - c.top - (container.clientHeight - el.clientHeight) / 2;
+  container.scrollBy({ top: delta, behavior: 'smooth' });
+}
+
+/** Briefly pulse a highlight ring/background on a field, then fade it out. */
+function pulseHighlight(el: HTMLElement): void {
+  el.style.transition = 'box-shadow 250ms ease, background-color 250ms ease';
+  el.style.borderRadius = 'var(--mantine-radius-sm)';
+  el.style.boxShadow = '0 0 0 3px var(--mantine-color-green-4)';
+  el.style.backgroundColor = 'var(--mantine-color-green-0)';
+  window.setTimeout(() => {
+    el.style.boxShadow = '';
+    el.style.backgroundColor = '';
+  }, 1600);
 }
