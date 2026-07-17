@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { ContentType } from '@medplum/core';
-import type { Bundle, BundleEntry } from '@medplum/fhirtypes';
+import type { Bot, Bundle, BundleEntry } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -12,12 +12,25 @@ interface BotDescription {
   criteria?: string;
 }
 
+// Self-hosted Docker runs bots in-process ('vmcontext'); hosted Medplum uses 'awslambda'.
+// Override with BOT_RUNTIME_VERSION=awslambda when targeting hosted infrastructure.
+const RUNTIME_VERSION = (process.env.BOT_RUNTIME_VERSION ?? 'vmcontext') as Bot['runtimeVersion'];
+
 const Bots: BotDescription[] = [
   {
     src: 'src/bots/core/intake-form.ts',
     dist: 'dist/bots/core/intake-form.js',
     criteria:
       'QuestionnaireResponse?questionnaire=https://medplum.com/Questionnaire/patient-intake-questionnaire-example',
+  },
+  // Invoked directly via medplum.executeBot() — no subscription criteria.
+  {
+    src: 'src/bots/core/intake-chat.ts',
+    dist: 'dist/bots/core/intake-chat.js',
+  },
+  {
+    src: 'src/bots/core/deepgram-token.ts',
+    dist: 'dist/bots/core/deepgram-token.js',
   },
 ];
 
@@ -39,7 +52,7 @@ async function main(): Promise<void> {
           resourceType: 'Bot',
           id: botIdPlaceholder,
           name: botName,
-          runtimeVersion: 'awslambda',
+          runtimeVersion: RUNTIME_VERSION,
           sourceCode: {
             contentType: ContentType.TYPESCRIPT,
             url: srcEntry.fullUrl,

@@ -21,6 +21,7 @@
     "trailingComma": "es5"
   },
   "devDependencies": {
+    "@aws-crypto/sha256-js": "^5.2.0",
     "@mantine/core": "8.3.18",
     "@mantine/hooks": "8.3.18",
     "@mantine/notifications": "8.3.18",

@@ -33,7 +33,9 @@ export function UploadDataPage(): JSX.Element {
 
   const { dataType } = useParams();
   const dataTypeDisplay = dataType ? capitalize(dataType) : '';
-  const buttonDisabled = dataType === 'bots' && (!checkQuestionnairesUploaded(medplum) || checkBotsUploaded(medplum));
+  // Bots can be (re)uploaded any time the questionnaire exists — uploadExampleBots is idempotent
+  // and redeploys code, so we don't block once bots already exist.
+  const buttonDisabled = dataType === 'bots' && !checkQuestionnairesUploaded(medplum);
 
   const handleUpload = useCallback(() => {
     if (!profile) {
@@ -223,11 +225,3 @@ function checkQuestionnairesUploaded(medplum: MedplumClient): boolean {
   return check;
 }
 
-function checkBotsUploaded(medplum: MedplumClient): boolean {
-  const exampleBots = medplum.searchResources('Bot', { name: 'intake-form' }).read();
-
-  if (exampleBots.length === 1) {
-    return true;
-  }
-  return false;
-}

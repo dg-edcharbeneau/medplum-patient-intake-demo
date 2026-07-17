@@ -18,14 +18,23 @@ const botLayerDeps = Object.keys(botLayer.dependencies);
 const esbuildOptions = {
   entryPoints: entryPoints,
   bundle: true, // Bundle imported functions
+  minify: true, // Shrink output so the deploy bundle stays under the server's maxJsonSize
   outdir: './dist', // Output directory for compiled files
   platform: 'node',
   loader: {
     '.ts': 'ts', // Load TypeScript files
   },
-  resolveExtensions: ['.ts'],
+  // Include JS extensions so bundled npm deps (e.g. @aws-sdk/client-bedrock-runtime) resolve.
+  resolveExtensions: ['.ts', '.js', '.mjs', '.json'],
   external: botLayerDeps,
-  format: 'esm',
+  // Medplum's vmcontext runtime evaluates bot code as CommonJS; ESM output throws
+  // "Unexpected token 'export'". CJS works for both vmcontext and awslambda.
+  format: 'cjs',
+  // vmcontext calls `exports.handler(...)` off a `const exports = {}`, but esbuild's CJS
+  // output reassigns `module.exports`, leaving that `exports` without `handler`. Copy it back.
+  footer: {
+    js: 'if (typeof module !== "undefined" && module.exports && module.exports.handler && typeof exports !== "undefined") { exports.handler = module.exports.handler; }',
+  },
   target: 'es2020', // Set the target ECMAScript version
   tsconfig: 'tsconfig.json',
 };

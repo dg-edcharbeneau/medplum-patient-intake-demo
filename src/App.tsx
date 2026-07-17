@@ -6,6 +6,7 @@ import {
   IconDatabaseImport,
   IconFilePencil,
   IconHealthRecognition,
+  IconMicrophone,
   IconPencil,
   IconQuestionMark,
   IconRobot,
@@ -14,6 +15,7 @@ import {
 import { Suspense, useEffect, useState } from 'react';
 import type { JSX } from 'react';
 import { Route, Routes } from 'react-router';
+import { IntakeChatPage } from './pages/IntakeChatPage';
 import { IntakeFormPage } from './pages/IntakeFormPage';
 import { IntakeResponsePage } from './pages/IntakeResponsePage';
 import { LandingPage } from './pages/LandingPage';
@@ -59,7 +61,10 @@ export function App(): JSX.Element | null {
         },
         {
           title: 'Onboarding',
-          links: [{ icon: <IconPencil />, label: 'New Patient', href: '/onboarding' }],
+          links: [
+            { icon: <IconPencil />, label: 'New Patient', href: '/onboarding' },
+            { icon: <IconMicrophone />, label: 'New Patient (Voice)', href: '/onboarding/chat' },
+          ],
         },
         intakeQuestionnaire
           ? {
@@ -96,6 +101,7 @@ export function App(): JSX.Element | null {
               </Route>
               <Route path="/Patient/:patientId/intake/:responseId" element={<IntakeResponsePage />} />
               <Route path="/onboarding" element={<IntakeFormPage />} />
+              <Route path="/onboarding/chat" element={<IntakeChatPage />} />
               <Route path="/:resourceType/:id">
                 <Route index element={<ResourcePage />} />
                 <Route path="*" element={<ResourcePage />} />
