@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import { handler } from './intake-chat';
 
-// Bedrock is now a signed fetch — mock the global fetch.
+// Bedrock is a signed fetch — mock the global fetch.
 const fetchMock = vi.fn();
 vi.stubGlobal('fetch', fetchMock);
 
@@ -24,15 +24,17 @@ function makeEvent(parameter: Parameters['parameter']): BotEvent<Parameters> {
     contentType: 'application/fhir+json',
     input: { resourceType: 'Parameters', parameter },
     secrets: {
-      AWS_REGION: { name: 'AWS_REGION', valueString: 'us-east-1' },
       AWS_ACCESS_KEY_ID: { name: 'AWS_ACCESS_KEY_ID', valueString: 'test-key' },
       AWS_SECRET_ACCESS_KEY: { name: 'AWS_SECRET_ACCESS_KEY', valueString: 'test-secret' },
-      BEDROCK_MODEL_ID: { name: 'BEDROCK_MODEL_ID', valueString: 'openai.gpt-oss-20b-1:0' },
     },
   };
 }
 
-describe('intake-chat bot', () => {
+function getParam(result: Parameters, name: string): string | undefined {
+  return result.parameter?.find((p) => p.name === name)?.valueString;
+}
+
+describe('intake-chat agent bot', () => {
   let medplum: MockClient;
 
   beforeEach(() => {
@@ -44,67 +46,67 @@ describe('intake-chat bot', () => {
     vi.clearAllMocks();
   });
 
-  test('parses a string answer and confirmation', async () => {
+  test('returns multi-field updates and the next message', async () => {
     fetchMock.mockResolvedValue(
-      bedrockOk(JSON.stringify({ answer: { valueString: 'Alex' }, assistantMessage: 'Got it, Alex.', needsClarification: false }))
+      bedrockOk(
+        JSON.stringify({
+          updates: { 'first-name': 'Alex', 'last-name': 'Kim' },
+          clear: [],
+          assistantMessage: 'Thanks Alex! What is your date of birth?',
+          submit: false,
+        })
+      )
     );
 
     const result = await handler(
       medplum,
       makeEvent([
-        { name: 'linkId', valueString: 'first-name' },
-        { name: 'itemText', valueString: 'What is your first name?' },
-        { name: 'itemType', valueString: 'string' },
-        { name: 'userMessage', valueString: 'My name is Alex' },
+        { name: 'schema', valueString: '[{"linkId":"first-name","label":"First name","type":"string","required":true}]' },
+        { name: 'formState', valueString: '{}' },
+        { name: 'history', valueString: '[]' },
+        { name: 'userMessage', valueString: "I'm Alex Kim" },
       ])
     );
 
-    const answer = result.parameter?.find((p) => p.name === 'answer')?.valueString;
-    const message = result.parameter?.find((p) => p.name === 'assistantMessage')?.valueString;
-    const needsClarification = result.parameter?.find((p) => p.name === 'needsClarification')?.valueString;
-
-    expect(JSON.parse(answer as string)).toEqual({ valueString: 'Alex' });
-    expect(message).toBe('Got it, Alex.');
-    expect(needsClarification).toBe('false');
+    expect(JSON.parse(getParam(result, 'updates') as string)).toEqual({ 'first-name': 'Alex', 'last-name': 'Kim' });
+    expect(getParam(result, 'assistantMessage')).toContain('date of birth');
+    expect(getParam(result, 'submit')).toBe('false');
   });
 
-  test('tolerates model output wrapped in prose / code fences', async () => {
+  test('tolerates code fences and surfaces submit + clear', async () => {
     fetchMock.mockResolvedValue(
-      bedrockOk('```json\n{"answer":{"valueBoolean":true},"assistantMessage":"Noted.","needsClarification":false}\n```')
+      bedrockOk('```json\n{"updates":{},"clear":["email"],"assistantMessage":"Submitting now.","submit":true}\n```')
     );
 
     const result = await handler(
       medplum,
       makeEvent([
-        { name: 'linkId', valueString: 'veteran-status' },
-        { name: 'itemText', valueString: 'Are you a veteran?' },
-        { name: 'itemType', valueString: 'boolean' },
-        { name: 'userMessage', valueString: 'yes' },
+        { name: 'schema', valueString: '[]' },
+        { name: 'formState', valueString: '{"first-name":"Alex"}' },
+        { name: 'history', valueString: '[]' },
+        { name: 'userMessage', valueString: 'remove my email and submit' },
       ])
     );
 
-    const answer = result.parameter?.find((p) => p.name === 'answer')?.valueString;
-    expect(JSON.parse(answer as string)).toEqual({ valueBoolean: true });
+    expect(JSON.parse(getParam(result, 'clear') as string)).toEqual(['email']);
+    expect(getParam(result, 'submit')).toBe('true');
   });
 
-  test('falls back to needsClarification on unparseable output', async () => {
-    fetchMock.mockResolvedValue(
-      bedrockOk('I am not sure what you mean.'));
+  test('degrades gracefully on unparseable output', async () => {
+    fetchMock.mockResolvedValue(bedrockOk('not json at all'));
 
     const result = await handler(
       medplum,
       makeEvent([
-        { name: 'linkId', valueString: 'first-name' },
-        { name: 'itemText', valueString: 'What is your first name?' },
-        { name: 'itemType', valueString: 'string' },
-        { name: 'userMessage', valueString: '...' },
+        { name: 'schema', valueString: '[]' },
+        { name: 'formState', valueString: '{}' },
+        { name: 'history', valueString: '[]' },
+        { name: 'userMessage', valueString: 'hello' },
       ])
     );
 
-    const answer = result.parameter?.find((p) => p.name === 'answer')?.valueString;
-    const needsClarification = result.parameter?.find((p) => p.name === 'needsClarification')?.valueString;
-    expect(answer).toBe('null');
-    expect(needsClarification).toBe('true');
+    expect(JSON.parse(getParam(result, 'updates') as string)).toEqual({});
+    expect(getParam(result, 'assistantMessage')).toBeTruthy();
   });
 
   test('throws when AWS credentials are missing', async () => {

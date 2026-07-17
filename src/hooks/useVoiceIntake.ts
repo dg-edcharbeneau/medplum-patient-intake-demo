@@ -33,10 +33,10 @@ export interface UseVoiceIntake extends UseIntakeChat {
   /** Start the conversation with voice (mic + spoken questions). */
   readonly startVoice: () => Promise<void>;
   /** Start the conversation in text-only mode (no mic, no audio). */
-  readonly startText: () => void;
+  readonly startText: () => Promise<void>;
   /** Stop the mic + audio; the chat state is preserved. */
   readonly stopVoice: () => void;
-  /** Text-fallback input (also used for option chips); speaks the reply if voice is active. */
+  /** Text-fallback input; speaks the reply if voice is active. */
   readonly sendText: (text: string) => Promise<void>;
 }
 
@@ -313,12 +313,14 @@ export function useVoiceIntake(questionnaire: Questionnaire): UseVoiceIntake {
     setStatus('idle');
   }, [clearTts]);
 
-  const startText = useCallback(() => {
+  const startText = useCallback(async () => {
     if (startedRef.current) {
       return;
     }
     startedRef.current = true;
-    chat.start();
+    setStatus('thinking');
+    await chat.start();
+    setStatus('idle');
   }, [chat]);
 
   const startVoice = useCallback(async () => {
@@ -331,17 +333,18 @@ export function useVoiceIntake(questionnaire: Questionnaire): UseVoiceIntake {
       const token = await getToken();
       await openSockets(token);
       voiceActiveRef.current = true;
-      setStatus('listening');
       if (!startedRef.current) {
         startedRef.current = true;
-        const first = chat.start();
+        setStatus('thinking');
+        const first = await chat.start();
         speakText(first);
       }
+      setStatus('listening');
     } catch (err) {
       setVoiceError(normalizeErrorString(err));
       stopVoice();
       // Fall back to text-only so the user is not stuck.
-      startText();
+      await startText();
     }
   }, [chat, getToken, openSockets, speakText, startText, stopVoice]);
 

@@ -9,6 +9,7 @@ import {
   Grid,
   Group,
   Paper,
+  Progress,
   ScrollArea,
   Stack,
   Text,
@@ -26,7 +27,7 @@ import {
   IconPlayerStopFilled,
   IconSend,
 } from '@tabler/icons-react';
-import { useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type { JSX } from 'react';
 import { useNavigate } from 'react-router';
 import { Loading } from '../components/Loading';
@@ -91,10 +92,12 @@ function IntakeChat(): JSX.Element {
     voice.sendText(value).catch((err) => showError(normalizeErrorString(err)));
   };
 
-  const handleSubmit = (): void => {
-    if (!profile) {
+  const submittedRef = useRef(false);
+  const handleSubmit = useCallback((): void => {
+    if (!profile || submittedRef.current) {
       return;
     }
+    submittedRef.current = true;
     setSubmitting(true);
     const response: QuestionnaireResponse = {
       ...voice.response,
@@ -109,9 +112,19 @@ function IntakeChat(): JSX.Element {
         navigate('/Patient')?.catch(console.error);
         window.scrollTo(0, 0);
       })
-      .catch((err) => showError(normalizeErrorString(err)))
+      .catch((err) => {
+        submittedRef.current = false;
+        showError(normalizeErrorString(err));
+      })
       .finally(() => setSubmitting(false));
-  };
+  }, [medplum, navigate, profile, voice]);
+
+  // The agent can request submission once the patient confirms.
+  useEffect(() => {
+    if (voice.submitRequested && voice.isComplete) {
+      handleSubmit();
+    }
+  }, [voice.submitRequested, voice.isComplete, handleSubmit]);
 
   return (
     <Box p="md">
@@ -127,6 +140,22 @@ function IntakeChat(): JSX.Element {
                 </Badge>
               </Group>
 
+              {started && voice.progress.total > 0 && (
+                <div>
+                  <Text size="xs" c="dimmed" mb={4}>
+                    {voice.isComplete
+                      ? 'All required details captured — you can submit'
+                      : `${voice.progress.current} of ${voice.progress.total} details captured`}
+                  </Text>
+                  <Progress
+                    value={(voice.progress.current / voice.progress.total) * 100}
+                    size="sm"
+                    radius="xl"
+                    color={voice.isComplete ? 'green' : 'blue'}
+                  />
+                </div>
+              )}
+
               {voice.voiceError && (
                 <Alert color="yellow" icon={<IconAlertCircle />} title="Voice unavailable">
                   {voice.voiceError} You can continue by typing below.
@@ -141,15 +170,24 @@ function IntakeChat(): JSX.Element {
                   <Group>
                     <Button
                       leftSection={<IconMicrophone size={18} />}
-                      disabled={!voice.voiceSupported}
+                      disabled={!voice.voiceSupported || !voice.ready || voice.pending}
                       onClick={() => voice.startVoice().catch((err) => showError(normalizeErrorString(err)))}
                     >
                       Start with voice
                     </Button>
-                    <Button variant="light" onClick={() => voice.startText()}>
+                    <Button
+                      variant="light"
+                      disabled={!voice.ready || voice.pending}
+                      onClick={() => voice.startText().catch((err) => showError(normalizeErrorString(err)))}
+                    >
                       Type instead
                     </Button>
                   </Group>
+                  {!voice.ready && (
+                    <Text size="xs" c="dimmed">
+                      Preparing the form…
+                    </Text>
+                  )}
                 </Stack>
               )}
 
@@ -179,23 +217,6 @@ function IntakeChat(): JSX.Element {
                   )}
                 </Stack>
               </ScrollArea>
-
-              {/* Choice chips for the current question */}
-              {started && voice.currentOptions && voice.currentOptions.length > 0 && (
-                <Group gap="xs">
-                  {voice.currentOptions.map((opt) => (
-                    <Button
-                      key={opt.label}
-                      size="xs"
-                      variant="outline"
-                      disabled={voice.pending}
-                      onClick={() => handleSend(opt.label)}
-                    >
-                      {opt.label}
-                    </Button>
-                  ))}
-                </Group>
-              )}
 
               {/* Text fallback input + voice controls */}
               {started && (

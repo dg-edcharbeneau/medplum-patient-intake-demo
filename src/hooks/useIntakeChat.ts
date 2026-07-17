@@ -10,16 +10,11 @@ import type {
   QuestionnaireResponseItem,
   QuestionnaireResponseItemAnswer,
 } from '@medplum/fhirtypes';
-import {
-  buildInitialResponse,
-  getItemAnswerOptionValue,
-  isChoiceQuestion,
-  isQuestionEnabled,
-  useMedplum,
-} from '@medplum/react';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { buildInitialResponse, getItemAnswerOptionValue, isChoiceQuestion, useMedplum } from '@medplum/react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 const INTAKE_CHAT_BOT = 'intake-chat';
+const OPENER = 'Begin the intake: greet the patient warmly and ask the first question.';
 
 export interface ChatMessage {
   readonly id: string;
@@ -27,60 +22,82 @@ export interface ChatMessage {
   readonly text: string;
 }
 
-/** A selectable option for a choice question (chips + LLM disambiguation). */
-export interface ChoiceOption {
-  readonly label: string;
-  readonly value: QuestionnaireResponseItemAnswer;
+interface FieldOption {
+  value: string;
+  label: string;
+  system?: string;
 }
 
-interface PathSeg {
-  readonly linkId: string;
-  readonly index: number;
-  readonly text?: string;
+interface FormField {
+  linkId: string;
+  label: string;
+  group?: string;
+  type: 'string' | 'date' | 'dateTime' | 'boolean' | 'integer' | 'choice' | 'reference';
+  required: boolean;
+  options?: FieldOption[];
+  valueSet?: string;
 }
-
-type Step =
-  | { readonly kind: 'question'; readonly item: QuestionnaireItem; readonly path: PathSeg[] }
-  | { readonly kind: 'repeat'; readonly group: QuestionnaireItem; readonly parentPath: PathSeg[]; readonly nextIndex: number };
 
 export interface UseIntakeChat {
   readonly messages: ChatMessage[];
   readonly response: QuestionnaireResponse;
-  /** Bumped on every merged answer so the live QuestionnaireForm can remount. */
   readonly version: number;
-  readonly currentItem: QuestionnaireItem | undefined;
-  readonly currentOptions: ChoiceOption[] | undefined;
-  readonly isComplete: boolean;
+  /** Whether the form schema has finished loading (choice options/value sets expanded). */
+  readonly ready: boolean;
   readonly pending: boolean;
   readonly error: string | undefined;
-  /** Kicks off the conversation; returns the first line to speak. */
-  readonly start: () => string;
-  /** Processes one user turn; returns the text the agent should speak next and whether the flow is done. */
+  readonly progress: { current: number; total: number };
+  /** Every required field has a value. */
+  readonly isComplete: boolean;
+  /** The agent asked to submit (after the patient confirmed). */
+  readonly submitRequested: boolean;
+  /** Opens the conversation (agent greets + asks first question); returns the text to speak. */
+  readonly start: () => Promise<string>;
+  /** One conversational turn; returns the text to speak next and whether the agent asked to submit. */
   readonly submitUserMessage: (text: string) => Promise<{ speak: string; done: boolean }>;
 }
 
 export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
   const medplum = useMedplum();
 
-  const stepsRef = useRef<Step[]>([]);
-  if (stepsRef.current.length === 0) {
-    stepsRef.current = buildSteps(questionnaire.item ?? [], []);
-  }
-
-  const responseRef = useRef<QuestionnaireResponse>(buildInitialResponse(questionnaire));
+  const schemaRef = useRef<FormField[]>([]);
+  const formStateRef = useRef<Record<string, unknown>>({});
+  const messagesRef = useRef<ChatMessage[]>([]);
   const botIdRef = useRef<string | undefined>(undefined);
+  const answerCache = useRef<Map<string, QuestionnaireResponseItemAnswer>>(new Map());
   const msgCounter = useRef(0);
 
+  const [ready, setReady] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [response, setResponse] = useState<QuestionnaireResponse>(() => buildInitialResponse(questionnaire));
   const [version, setVersion] = useState(0);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [submitRequested, setSubmitRequested] = useState(false);
+  const [filledCount, setFilledCount] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
 
-  const addMessage = useCallback((role: ChatMessage['role'], text: string) => {
+  // Build the flattened form schema once (expands choice value sets).
+  useEffect(() => {
+    let cancelled = false;
+    buildFormSchema(medplum, questionnaire)
+      .then((schema) => {
+        if (!cancelled) {
+          schemaRef.current = schema;
+          setReady(true);
+        }
+      })
+      .catch((err) => setError(normalizeErrorString(err)));
+    return () => {
+      cancelled = true;
+    };
+  }, [medplum, questionnaire]);
+
+  const addMessage = useCallback((role: ChatMessage['role'], text: string): void => {
     msgCounter.current += 1;
-    setMessages((prev) => [...prev, { id: `m${msgCounter.current}`, role, text }]);
+    const msg: ChatMessage = { id: `m${msgCounter.current}`, role, text };
+    messagesRef.current = [...messagesRef.current, msg];
+    setMessages(messagesRef.current);
   }, []);
 
   const resolveBotId = useCallback(async (): Promise<string> => {
@@ -95,293 +112,337 @@ export function useIntakeChat(questionnaire: Questionnaire): UseIntakeChat {
     return bot.id;
   }, [medplum]);
 
-  const currentStep = stepsRef.current[currentIndex];
-  const currentItem = currentStep?.kind === 'question' ? currentStep.item : undefined;
-
-  // Chips for inline-answerOption choice questions (voice/text fallback aid).
-  const currentOptions = useMemo<ChoiceOption[] | undefined>(() => {
-    if (currentItem && isChoiceQuestion(currentItem) && currentItem.answerOption) {
-      return currentItem.answerOption.map((o) => optionToChoice(getItemAnswerOptionValue(o)));
-    }
-    return undefined;
-  }, [currentItem]);
-
-  const start = useCallback((): string => {
-    const idx = findNextIndex(stepsRef.current, 0, responseRef.current);
-    setCurrentIndex(idx);
-    const prompt = idx < stepsRef.current.length ? promptForStep(stepsRef.current[idx]) : COMPLETE_MESSAGE;
-    if (idx >= stepsRef.current.length) {
-      setIsComplete(true);
-    }
-    addMessage('assistant', prompt);
-    return prompt;
-  }, [addMessage]);
-
-  const advanceFrom = useCallback((from: number): { prompt: string; done: boolean } => {
-    const idx = findNextIndex(stepsRef.current, from, responseRef.current);
-    setCurrentIndex(idx);
-    if (idx >= stepsRef.current.length) {
-      setIsComplete(true);
-      return { prompt: COMPLETE_MESSAGE, done: true };
-    }
-    return { prompt: promptForStep(stepsRef.current[idx]), done: false };
+  const refreshDerived = useCallback((): void => {
+    const schema = schemaRef.current;
+    const state = formStateRef.current;
+    const filled = schema.filter((f) => hasValue(state[f.linkId])).length;
+    setFilledCount(filled);
+    setIsComplete(schema.filter((f) => f.required).every((f) => hasValue(state[f.linkId])));
   }, []);
 
-  const submitUserMessage = useCallback(
-    async (text: string): Promise<{ speak: string; done: boolean }> => {
-      const trimmed = text.trim();
-      if (!trimmed || pending || isComplete) {
-        return { speak: '', done: isComplete };
-      }
-      addMessage('user', trimmed);
-      setError(undefined);
-      setPending(true);
+  const rebuildResponse = useCallback(async (): Promise<void> => {
+    const qr = await buildResponse(medplum, questionnaire, schemaRef.current, formStateRef.current, answerCache.current);
+    setResponse(qr);
+    setVersion((v) => v + 1);
+  }, [medplum, questionnaire]);
+
+  const runTurn = useCallback(
+    async (userMessage: string, opener: boolean): Promise<{ speak: string; done: boolean }> => {
       try {
-        const step = stepsRef.current[currentIndex];
-
-        // Repeating-group prompt is a local yes/no.
-        if (step?.kind === 'repeat') {
-          const wantsMore = /\b(yes|yeah|yep|sure|another|add|more)\b/i.test(trimmed);
-          if (wantsMore) {
-            const instance = buildGroupInstanceSteps(step.group, step.parentPath, step.nextIndex);
-            stepsRef.current.splice(currentIndex + 1, 0, ...instance);
-          }
-          const confirm = wantsMore ? 'Sure, let’s add another.' : 'Okay.';
-          addMessage('assistant', confirm);
-          const next = advanceFrom(currentIndex + 1);
-          addMessage('assistant', next.prompt);
-          return { speak: `${confirm} ${next.prompt}`.trim(), done: next.done };
-        }
-
-        if (step?.kind !== 'question') {
-          return { speak: '', done: true };
-        }
-        const item = step.item;
-
-        // Reference items resolve to an Organization by name search.
-        if (item.type === 'reference') {
-          const orgs = await medplum.searchResources('Organization', { name: trimmed, _count: 1 });
-          if (orgs.length === 0) {
-            const msg = `I couldn’t find an organization named “${trimmed}”. What is its name?`;
-            addMessage('assistant', msg);
-            return { speak: msg, done: false };
-          }
-          const org = orgs[0];
-          setAnswer(responseRef.current, step.path, item, {
-            valueReference: { reference: `Organization/${org.id}`, display: org.name },
-          });
-          setVersion((v) => v + 1);
-          const confirm = `Got it — ${org.name}.`;
-          addMessage('assistant', confirm);
-          const next = advanceFrom(currentIndex + 1);
-          addMessage('assistant', next.prompt);
-          return { speak: `${confirm} ${next.prompt}`.trim(), done: next.done };
-        }
-
-        // Choice options: inline answerOption, or a filtered ValueSet expansion.
-        const options = await getChoiceOptions(medplum, item, trimmed);
-
         const botId = await resolveBotId();
+        const history = messagesRef.current.slice(-20).map((m) => ({ role: m.role, content: m.text }));
         const params: Parameters = {
           resourceType: 'Parameters',
           parameter: [
-            { name: 'linkId', valueString: item.linkId },
-            { name: 'itemText', valueString: item.text ?? '' },
-            { name: 'itemType', valueString: item.type },
-            { name: 'userMessage', valueString: trimmed },
-            { name: 'context', valueString: summarizeContext(responseRef.current) },
-            ...(options ? [{ name: 'answerOptions', valueString: JSON.stringify(options) }] : []),
+            { name: 'schema', valueString: JSON.stringify(schemaRef.current.map(toSchemaForModel)) },
+            { name: 'formState', valueString: JSON.stringify(formStateRef.current) },
+            { name: 'history', valueString: JSON.stringify(opener ? [] : history) },
+            { name: 'userMessage', valueString: userMessage },
           ],
         };
-
         const result = (await medplum.executeBot(botId, params, ContentType.FHIR_JSON)) as Parameters;
-        const answerStr = getResultParam(result, 'answer');
+
         const assistantMessage = getResultParam(result, 'assistantMessage') ?? '';
-        const needsClarification = getResultParam(result, 'needsClarification') === 'true';
-        const answerObj =
-          answerStr && answerStr !== 'null' ? (JSON.parse(answerStr) as QuestionnaireResponseItemAnswer) : null;
+        const updates = safeParseObject(getResultParam(result, 'updates'));
+        const clear = safeParseStringArray(getResultParam(result, 'clear'));
+        const submit = getResultParam(result, 'submit') === 'true';
 
-        if (needsClarification || !answerObj) {
-          const msg = assistantMessage || 'Sorry, could you say that again?';
-          addMessage('assistant', msg);
-          return { speak: msg, done: false };
+        // Apply updates/clears to the working form state.
+        const next = { ...formStateRef.current };
+        for (const [k, v] of Object.entries(updates)) {
+          if (schemaRef.current.some((f) => f.linkId === k)) {
+            next[k] = v;
+          }
         }
+        for (const k of clear) {
+          delete next[k];
+        }
+        formStateRef.current = next;
 
-        setAnswer(responseRef.current, step.path, item, answerObj);
-        setVersion((v) => v + 1);
         if (assistantMessage) {
           addMessage('assistant', assistantMessage);
         }
-        const next = advanceFrom(currentIndex + 1);
-        addMessage('assistant', next.prompt);
-        return { speak: `${assistantMessage} ${next.prompt}`.trim(), done: next.done };
+        refreshDerived();
+        await rebuildResponse();
+        if (submit) {
+          setSubmitRequested(true);
+        }
+        return { speak: assistantMessage, done: submit };
       } catch (err) {
         const msg = normalizeErrorString(err);
         setError(msg);
         addMessage('assistant', `Something went wrong: ${msg}`);
         return { speak: 'Something went wrong.', done: false };
+      }
+    },
+    [addMessage, medplum, rebuildResponse, refreshDerived, resolveBotId]
+  );
+
+  const start = useCallback(async (): Promise<string> => {
+    if (pending || messagesRef.current.length > 0) {
+      return '';
+    }
+    setPending(true);
+    try {
+      const { speak } = await runTurn(OPENER, true);
+      return speak;
+    } finally {
+      setPending(false);
+    }
+  }, [pending, runTurn]);
+
+  const submitUserMessage = useCallback(
+    async (text: string): Promise<{ speak: string; done: boolean }> => {
+      const trimmed = text.trim();
+      if (!trimmed || pending) {
+        return { speak: '', done: false };
+      }
+      addMessage('user', trimmed);
+      setError(undefined);
+      setPending(true);
+      try {
+        return await runTurn(trimmed, false);
       } finally {
         setPending(false);
       }
     },
-    [addMessage, advanceFrom, currentIndex, isComplete, medplum, pending, resolveBotId]
+    [addMessage, pending, runTurn]
   );
 
   return {
     messages,
-    response: responseRef.current,
+    response,
     version,
-    currentItem,
-    currentOptions,
-    isComplete,
+    ready,
     pending,
     error,
+    progress: { current: filledCount, total: schemaRef.current.length },
+    isComplete,
+    submitRequested,
     start,
     submitUserMessage,
   };
 }
 
-const COMPLETE_MESSAGE = 'That’s everything! Please review the form on the right and submit when you’re ready.';
-
 // ---------------------------------------------------------------------------
-// Pure helpers
+// Schema + response construction
 // ---------------------------------------------------------------------------
 
-function buildSteps(items: QuestionnaireItem[], parentPath: PathSeg[]): Step[] {
-  const steps: Step[] = [];
-  for (const item of items) {
-    if (item.type === 'display') {
-      continue;
-    }
-    if (item.type === 'group') {
-      const groupPath: PathSeg[] = [...parentPath, { linkId: item.linkId, index: 0, text: item.text }];
-      steps.push(...buildSteps(item.item ?? [], groupPath));
-      if (item.repeats) {
-        steps.push({ kind: 'repeat', group: item, parentPath, nextIndex: 1 });
+async function buildFormSchema(
+  medplum: ReturnType<typeof useMedplum>,
+  questionnaire: Questionnaire
+): Promise<FormField[]> {
+  const fields: FormField[] = [];
+
+  async function walk(items: QuestionnaireItem[], groupText: string | undefined): Promise<void> {
+    for (const item of items) {
+      if (item.type === 'display') {
+        continue;
       }
-    } else {
-      steps.push({ kind: 'question', item, path: parentPath });
+      if (item.type === 'group') {
+        await walk(item.item ?? [], item.text ?? groupText);
+        continue;
+      }
+      const field: FormField = {
+        linkId: item.linkId,
+        label: item.text ?? item.linkId,
+        group: groupText,
+        type: mapType(item.type),
+        required: Boolean(item.required),
+      };
+      if (isChoiceQuestion(item)) {
+        if (item.answerOption) {
+          field.options = item.answerOption.map((o) => optionFrom(getItemAnswerOptionValue(o)));
+        } else if (item.answerValueSet) {
+          field.valueSet = item.answerValueSet;
+          try {
+            const vs = await medplum.valueSetExpand({ url: item.answerValueSet, count: 40 });
+            const contains = vs.expansion?.contains ?? [];
+            if (contains.length > 0 && contains.length <= 40) {
+              field.options = contains.map((c) => ({
+                value: c.code ?? c.display ?? '',
+                label: c.display ?? c.code ?? '',
+                system: c.system,
+              }));
+            }
+          } catch {
+            // leave as free-text; resolved at conversion time
+          }
+        }
+      }
+      fields.push(field);
     }
   }
-  return steps;
+
+  await walk(questionnaire.item ?? [], undefined);
+  return fields;
 }
 
-function buildGroupInstanceSteps(group: QuestionnaireItem, parentPath: PathSeg[], index: number): Step[] {
-  const groupPath: PathSeg[] = [...parentPath, { linkId: group.linkId, index, text: group.text }];
-  const inner = buildSteps(group.item ?? [], groupPath);
-  inner.push({ kind: 'repeat', group, parentPath, nextIndex: index + 1 });
-  return inner;
-}
-
-function findNextIndex(steps: Step[], from: number, response: QuestionnaireResponse): number {
-  let i = from;
-  while (i < steps.length) {
-    const s = steps[i];
-    if (s.kind === 'repeat' || isQuestionEnabled(s.item, response)) {
-      return i;
-    }
-    i++;
+function mapType(type: string | undefined): FormField['type'] {
+  switch (type) {
+    case 'choice':
+    case 'open-choice':
+      return 'choice';
+    case 'reference':
+      return 'reference';
+    case 'boolean':
+      return 'boolean';
+    case 'integer':
+    case 'decimal':
+      return 'integer';
+    case 'date':
+      return 'date';
+    case 'dateTime':
+      return 'dateTime';
+    default:
+      return 'string';
   }
-  return steps.length;
 }
 
-function promptForStep(step: Step): string {
-  if (step.kind === 'repeat') {
-    const label = (step.group.text ?? 'entry').replace(/\.$/, '').toLowerCase();
-    return `Would you like to add another ${label}?`;
-  }
-  return step.item.text ?? 'Please provide a value.';
-}
-
-function optionToChoice(tv: { type: string; value: unknown }): ChoiceOption {
+function optionFrom(tv: { type: string; value: unknown }): FieldOption {
   if (tv.type === 'Coding') {
     const coding = tv.value as Coding;
-    return { label: coding.display ?? coding.code ?? '', value: { valueCoding: coding } };
+    return { value: coding.code ?? coding.display ?? '', label: coding.display ?? coding.code ?? '', system: coding.system };
   }
   const str = String(tv.value);
-  return { label: str, value: { valueString: str } };
+  return { value: str, label: str };
 }
 
-async function getChoiceOptions(
+/** Trim the schema to what the model needs (labels + option choices). */
+function toSchemaForModel(field: FormField): Record<string, unknown> {
+  return {
+    linkId: field.linkId,
+    label: field.label,
+    ...(field.group ? { group: field.group } : {}),
+    type: field.type,
+    required: field.required,
+    ...(field.options ? { options: field.options.map((o) => ({ value: o.value, label: o.label })) } : {}),
+  };
+}
+
+async function buildResponse(
   medplum: ReturnType<typeof useMedplum>,
-  item: QuestionnaireItem,
-  filter: string
-): Promise<ChoiceOption[] | undefined> {
-  if (!isChoiceQuestion(item)) {
-    return undefined;
-  }
-  if (item.answerOption) {
-    return item.answerOption.map((o) => optionToChoice(getItemAnswerOptionValue(o)));
-  }
-  if (item.answerValueSet) {
-    try {
-      const vs = await medplum.valueSetExpand({ url: item.answerValueSet, filter, count: 10 });
-      const contains = vs.expansion?.contains ?? [];
-      return contains.map((c) => ({
-        label: c.display ?? c.code ?? '',
-        value: { valueCoding: { system: c.system, code: c.code, display: c.display } },
-      }));
-    } catch {
-      return undefined;
+  questionnaire: Questionnaire,
+  schema: FormField[],
+  formState: Record<string, unknown>,
+  cache: Map<string, QuestionnaireResponseItemAnswer>
+): Promise<QuestionnaireResponse> {
+  const qr = buildInitialResponse(questionnaire);
+  for (const field of schema) {
+    const value = formState[field.linkId];
+    if (!hasValue(value)) {
+      continue;
     }
-  }
-  return undefined;
-}
-
-/** Ensures the nested group items exist along `path`, then sets the leaf answer (mutates response). */
-function setAnswer(
-  response: QuestionnaireResponse,
-  path: PathSeg[],
-  item: QuestionnaireItem,
-  answer: QuestionnaireResponseItemAnswer
-): void {
-  let container: QuestionnaireResponseItem[] = response.item ?? (response.item = []);
-  for (const seg of path) {
-    const sameLink = container.filter((i) => i.linkId === seg.linkId);
-    while (sameLink.length <= seg.index) {
-      const gi: QuestionnaireResponseItem = { linkId: seg.linkId, text: seg.text, item: [] };
-      container.push(gi);
-      sameLink.push(gi);
-    }
-    const g = sameLink[seg.index];
-    container = g.item ?? (g.item = []);
-  }
-  let leaf = container.find((i) => i.linkId === item.linkId);
-  if (!leaf) {
-    leaf = { linkId: item.linkId, text: item.text };
-    container.push(leaf);
-  }
-  leaf.answer = [answer];
-}
-
-/** A compact recent-answers summary passed to the model for disambiguation. */
-function summarizeContext(response: QuestionnaireResponse): string {
-  const parts: string[] = [];
-  collectAnswers(response.item ?? [], parts);
-  return parts.slice(-8).join('; ');
-}
-
-function collectAnswers(items: QuestionnaireResponseItem[], out: string[]): void {
-  for (const item of items) {
-    if (item.answer?.[0]) {
-      const a = item.answer[0];
-      const value =
-        a.valueString ??
-        a.valueCoding?.display ??
-        a.valueReference?.display ??
-        (a.valueBoolean !== undefined ? String(a.valueBoolean) : undefined) ??
-        a.valueDate ??
-        a.valueDateTime;
-      if (value) {
-        out.push(`${item.text ?? item.linkId}: ${value}`);
+    const key = `${field.linkId}|${JSON.stringify(value)}`;
+    let answer = cache.get(key);
+    if (!answer) {
+      const resolved = await toAnswer(medplum, field, value);
+      if (resolved) {
+        answer = resolved;
+        cache.set(key, resolved);
       }
     }
-    if (item.item) {
-      collectAnswers(item.item, out);
+    if (answer) {
+      setAnswerByLinkId(qr.item ?? [], field.linkId, answer);
     }
   }
+  return qr;
+}
+
+async function toAnswer(
+  medplum: ReturnType<typeof useMedplum>,
+  field: FormField,
+  value: unknown
+): Promise<QuestionnaireResponseItemAnswer | undefined> {
+  const str = String(value).trim();
+  if (!str) {
+    return undefined;
+  }
+  switch (field.type) {
+    case 'boolean':
+      return { valueBoolean: value === true || /^(true|yes|y)$/i.test(str) };
+    case 'integer': {
+      const n = Number(str);
+      return Number.isFinite(n) ? { valueInteger: Math.trunc(n) } : undefined;
+    }
+    case 'date':
+      return { valueDate: str.slice(0, 10) };
+    case 'dateTime':
+      return { valueDateTime: str.length <= 10 ? `${str}T00:00:00Z` : str };
+    case 'reference': {
+      const orgs = await medplum.searchResources('Organization', { name: str, _count: 1 });
+      return orgs.length ? { valueReference: { reference: `Organization/${orgs[0].id}`, display: orgs[0].name } } : undefined;
+    }
+    case 'choice': {
+      const opt = field.options?.find(
+        (o) => o.value === str || o.label.toLowerCase() === str.toLowerCase() || o.value.toLowerCase() === str.toLowerCase()
+      );
+      if (opt) {
+        return opt.system ? { valueCoding: { system: opt.system, code: opt.value, display: opt.label } } : { valueString: opt.value };
+      }
+      if (field.valueSet) {
+        try {
+          const vs = await medplum.valueSetExpand({ url: field.valueSet, filter: str, count: 5 });
+          const first = vs.expansion?.contains?.[0];
+          if (first) {
+            return { valueCoding: { system: first.system, code: first.code, display: first.display } };
+          }
+        } catch {
+          // fall through to string
+        }
+      }
+      return { valueString: str };
+    }
+    default:
+      return { valueString: str };
+  }
+}
+
+function setAnswerByLinkId(items: QuestionnaireResponseItem[], linkId: string, answer: QuestionnaireResponseItemAnswer): boolean {
+  for (const item of items) {
+    if (item.linkId === linkId) {
+      item.answer = [answer];
+      return true;
+    }
+    if (item.item && setAnswerByLinkId(item.item, linkId, answer)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function hasValue(v: unknown): boolean {
+  return v !== undefined && v !== null && v !== '';
 }
 
 function getResultParam(result: Parameters, name: string): string | undefined {
   return result.parameter?.find((p) => p.name === name)?.valueString;
+}
+
+function safeParseObject(value: string | undefined): Record<string, unknown> {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function safeParseStringArray(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
 }

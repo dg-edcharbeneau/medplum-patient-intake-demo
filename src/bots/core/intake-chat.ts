@@ -9,33 +9,33 @@ const DEFAULT_REGION = 'us-east-1';
 const BEDROCK_SERVICE = 'bedrock';
 
 /**
- * Stateless "brain" bot for the voice/chat intake flow.
+ * Conversational "agent" bot for the intake flow.
  *
- * Given a single questionnaire item and the patient's latest reply (typed or transcribed), it calls
- * Amazon Bedrock and returns the parsed FHIR answer for that item plus a short, spoken-friendly
- * confirmation message. The frontend owns questionnaire ordering, enableWhen, repeats, and merging.
+ * The agent owns the conversation: it receives the whole form schema, the data collected so far,
+ * and the chat history, then decides what to ask next, captures whatever the patient said (possibly
+ * several fields at once), and returns the fields to set/clear plus the next thing to say. The
+ * frontend just applies the updates, renders the form, and speaks the message.
  *
  * Input: Parameters with parts:
- *  - linkId (valueString), itemText (valueString), itemType (valueString)
- *  - answerOptions (valueString, JSON array of {code, system, display}) — for choice items
- *  - userMessage (valueString) — the patient's reply
- *  - context (valueString, optional) — recent answers, for disambiguation
+ *  - schema (valueString)      — JSON array of form fields {linkId, label, type, required, options?}
+ *  - formState (valueString)   — JSON object of the answers collected so far {linkId: value}
+ *  - history (valueString)     — JSON array of prior turns [{role:'user'|'assistant', content}]
+ *  - userMessage (valueString) — the patient's latest message
  *
  * Output: Parameters with parts:
- *  - answer (valueString) — JSON of a single FHIR answer object, or "null"
- *  - assistantMessage (valueString) — short natural-language confirmation / follow-up
- *  - needsClarification (valueString) — "true" | "false"
+ *  - assistantMessage (valueString) — what to say/speak next
+ *  - updates (valueString)          — JSON object of fields to set this turn {linkId: value}
+ *  - clear (valueString)            — JSON array of linkIds to clear
+ *  - submit (valueString)           — "true" | "false"
  */
 export async function handler(_medplum: MedplumClient, event: BotEvent<Parameters>): Promise<Parameters> {
   const getParam = (name: string): string | undefined =>
     event.input.parameter?.find((p) => p.name === name)?.valueString;
 
-  const linkId = getParam('linkId') ?? '';
-  const itemText = getParam('itemText') ?? '';
-  const itemType = getParam('itemType') ?? 'string';
-  const answerOptions = getParam('answerOptions');
+  const schema = getParam('schema') ?? '[]';
+  const formState = getParam('formState') ?? '{}';
+  const history = safeParseArray(getParam('history'));
   const userMessage = getParam('userMessage') ?? '';
-  const context = getParam('context');
 
   const region = event.secrets['AWS_REGION']?.valueString ?? DEFAULT_REGION;
   const accessKeyId = event.secrets['AWS_ACCESS_KEY_ID']?.valueString;
@@ -47,13 +47,17 @@ export async function handler(_medplum: MedplumClient, event: BotEvent<Parameter
     throw new Error('Missing AWS credentials. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY bot secrets.');
   }
 
-  const systemPrompt = buildSystemPrompt();
-  const userPrompt = buildUserPrompt({ linkId, itemText, itemType, answerOptions, userMessage, context });
+  const messages = [
+    ...history
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+      .map((m) => ({ role: m.role, content: [{ text: String(m.content) }] })),
+    { role: 'user', content: [{ text: `USER_DATA: ${formState}\nUSER_REQUEST: ${userMessage}` }] },
+  ];
 
   const requestBody = JSON.stringify({
-    system: [{ text: systemPrompt }],
-    messages: [{ role: 'user', content: [{ text: userPrompt }] }],
-    inferenceConfig: { maxTokens: 512, temperature: 0 },
+    system: [{ text: buildSystemPrompt(schema) }],
+    messages,
+    inferenceConfig: { maxTokens: 700, temperature: 0 },
   });
 
   const bedrockResponse = await invokeConverse({
@@ -68,57 +72,36 @@ export async function handler(_medplum: MedplumClient, event: BotEvent<Parameter
   const parsed = parseModelJson(rawText);
 
   const parameter: ParametersParameter[] = [
-    { name: 'answer', valueString: JSON.stringify(parsed.answer ?? null) },
     { name: 'assistantMessage', valueString: parsed.assistantMessage ?? '' },
-    { name: 'needsClarification', valueString: String(Boolean(parsed.needsClarification)) },
+    { name: 'updates', valueString: JSON.stringify(parsed.updates ?? {}) },
+    { name: 'clear', valueString: JSON.stringify(parsed.clear ?? []) },
+    { name: 'submit', valueString: String(Boolean(parsed.submit)) },
   ];
 
   return { resourceType: 'Parameters', parameter };
 }
 
-function buildSystemPrompt(): string {
+function buildSystemPrompt(schema: string): string {
+  const today = new Date().toISOString().slice(0, 10); // yyyy-MM-dd
   return [
-    'You help patients fill out a medical intake form by voice.',
-    'You are given ONE FHIR Questionnaire item and the patient\'s latest reply.',
-    'Convert the reply into a single FHIR QuestionnaireResponse answer object for that item.',
-    'Answer object shape depends on the item type:',
-    '- string/text: {"valueString": "..."}',
-    '- boolean: {"valueBoolean": true|false}',
-    '- integer: {"valueInteger": 123}',
-    '- date: {"valueDate": "YYYY-MM-DD"}',
-    '- dateTime: {"valueDateTime": "YYYY-MM-DDThh:mm:ssZ"}',
-    '- choice: pick the single best match from the provided options and return its exact "value" object as answer',
-    '- reference: {"valueReference": {"display": "..."}} (frontend resolves the actual reference)',
-    'Rules:',
-    '- Return ONLY minified JSON, no prose, no markdown fences.',
-    '- JSON shape: {"answer": <answer object or null>, "assistantMessage": "<short confirmation, max ~12 words>", "needsClarification": <true|false>}.',
-    '- If the reply is unclear, empty, or does not answer the question, set answer=null, needsClarification=true, and make assistantMessage a brief re-ask.',
-    '- When options are provided (JSON array of {label, value}), choose the best match and return its "value" object verbatim; never invent a value.',
-    '- assistantMessage is spoken aloud, so keep it short and natural.',
+    `Current date: ${today}.`,
+    '- You are helping a patient complete a medical intake. Assist them in a warm, natural conversation.',
+    `- The form fields are described by this JSON schema: ${schema}`,
+    '- USER_DATA (sent with each request) is the data collected so far.',
+    '- Each time the patient provides information that maps to one or more fields, set those fields.',
+    '- Convert any dates the patient gives to yyyy-MM-dd format.',
+    '- For a choice field, the value MUST be one of that field\'s allowed option values; if the reply does not match, ask them to clarify.',
+    '- Guide the patient by asking about missing data WITHOUT revealing they are filling out a form.',
+    '- Ask about only one item at a time.',
+    '- Briefly acknowledge what you captured, then ask the next question. Keep replies short and natural — they may be spoken aloud.',
+    '- If the patient wants to change or remove something, clear those fields.',
+    '- When all required fields have values, summarize briefly and ask if they would like to submit.',
+    '- Set submit=true only after the patient confirms they want to submit.',
+    'Respond with ONLY minified JSON, no prose and no code fences, in exactly this shape:',
+    '{"updates":{"<linkId>":<value>},"clear":["<linkId>"],"assistantMessage":"<what to say next>","submit":<true|false>}',
+    '- Put in "updates" only the fields you are setting this turn (omit the rest). Use each choice field\'s allowed option value.',
+    '- "clear" and "submit" are optional; use [] and false when nothing applies.',
   ].join('\n');
-}
-
-function buildUserPrompt(args: {
-  linkId: string;
-  itemText: string;
-  itemType: string;
-  answerOptions?: string;
-  userMessage: string;
-  context?: string;
-}): string {
-  const lines = [
-    `Item linkId: ${args.linkId}`,
-    `Item type: ${args.itemType}`,
-    `Question: ${args.itemText}`,
-  ];
-  if (args.answerOptions) {
-    lines.push(`Allowed options (JSON): ${args.answerOptions}`);
-  }
-  if (args.context) {
-    lines.push(`Recent answers for context: ${args.context}`);
-  }
-  lines.push(`Patient reply: "${args.userMessage}"`);
-  return lines.join('\n');
 }
 
 interface ConverseResponse {
@@ -214,14 +197,34 @@ function signRequest(args: InvokeArgs & { host: string; canonicalUri: string }):
   return headers;
 }
 
-interface ModelResult {
-  answer: unknown;
+// --- Response parsing -------------------------------------------------------
+
+interface AgentResult {
+  updates?: Record<string, unknown>;
+  clear?: string[];
   assistantMessage?: string;
-  needsClarification?: boolean;
+  submit?: boolean;
+}
+
+interface HistoryTurn {
+  role?: string;
+  content?: string;
+}
+
+function safeParseArray(value: string | undefined): HistoryTurn[] {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? (parsed as HistoryTurn[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 /** Extract the JSON object from a model response, tolerating stray text or code fences. */
-function parseModelJson(text: string): ModelResult {
+function parseModelJson(text: string): AgentResult {
   const trimmed = text.trim();
   const candidates = [trimmed];
   const start = trimmed.indexOf('{');
@@ -231,7 +234,7 @@ function parseModelJson(text: string): ModelResult {
   }
   for (const candidate of candidates) {
     try {
-      const obj = JSON.parse(candidate) as ModelResult;
+      const obj = JSON.parse(candidate) as AgentResult;
       if (obj && typeof obj === 'object') {
         return obj;
       }
@@ -239,5 +242,5 @@ function parseModelJson(text: string): ModelResult {
       // try next candidate
     }
   }
-  return { answer: null, assistantMessage: "Sorry, I didn't catch that. Could you say it again?", needsClarification: true };
+  return { assistantMessage: "Sorry, I didn't catch that — could you say it again?" };
 }
