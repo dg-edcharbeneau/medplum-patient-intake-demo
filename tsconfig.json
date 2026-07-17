@@ -4,7 +4,7 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "lib": ["DOM", "DOM.Iterable", "ESNext"],
-    "types": ["vitest/globals", "vite/client"],
+    "types": ["vitest/globals", "vite/client", "node"],
     "jsx": "react-jsx",
     "strict": true,
     "erasableSyntaxOnly": true,
