@@ -13,12 +13,15 @@ const PCM_WORKLET_URL = `${import.meta.env.BASE_URL}pcm-worklet.js`;
 
 const DEEPGRAM_TOKEN_BOT = 'deepgram-token';
 const STT_MODEL = 'flux-general-en';
-const TTS_MODEL = 'aura-2-thalia-en';
+// Fallback voice if the deepgram-token bot doesn't return one (configure via the
+// DEEPGRAM_VOICE_ID project secret, read by the bot).
+const DEFAULT_VOICE_ID = 'aura-2-thalia-en';
 const STT_SAMPLE_RATE = 16000;
 const TTS_SAMPLE_RATE = 24000;
 
 const FLUX_URL = `wss://api.deepgram.com/v2/listen?model=${STT_MODEL}&encoding=linear16&sample_rate=${STT_SAMPLE_RATE}`;
-const AURA_URL = `wss://api.deepgram.com/v1/speak?model=${TTS_MODEL}&encoding=linear16&sample_rate=${TTS_SAMPLE_RATE}`;
+const auraUrl = (voiceId: string): string =>
+  `wss://api.deepgram.com/v1/speak?model=${encodeURIComponent(voiceId)}&encoding=linear16&sample_rate=${TTS_SAMPLE_RATE}`;
 
 export type VoiceStatus = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking';
 
@@ -74,7 +77,7 @@ export function useVoiceIntake(questionnaire: Questionnaire): UseVoiceIntake {
   const submitRef = useRef(chat.submitUserMessage);
   submitRef.current = chat.submitUserMessage;
 
-  const getToken = useCallback(async (): Promise<string> => {
+  const getToken = useCallback(async (): Promise<{ token: string; voiceId: string }> => {
     const bot = await medplum.searchOne('Bot', { name: DEEPGRAM_TOKEN_BOT });
     if (!bot?.id) {
       throw new Error(`Bot "${DEEPGRAM_TOKEN_BOT}" not found. Deploy bots via Upload Example Bots.`);
@@ -85,7 +88,8 @@ export function useVoiceIntake(questionnaire: Questionnaire): UseVoiceIntake {
     if (!token) {
       throw new Error('Deepgram token bot did not return an access_token.');
     }
-    return token;
+    const voiceId = result.parameter?.find((p) => p.name === 'voice_id')?.valueString ?? DEFAULT_VOICE_ID;
+    return { token, voiceId };
   }, [medplum]);
 
   // --- TTS playback ------------------------------------------------------
@@ -237,9 +241,9 @@ export function useVoiceIntake(questionnaire: Questionnaire): UseVoiceIntake {
   // --- Start / stop ------------------------------------------------------
 
   const openSockets = useCallback(
-    async (token: string) => {
+    async (token: string, voiceId: string) => {
       // TTS socket
-      const aura = new WebSocket(AURA_URL, ['token', token]);
+      const aura = new WebSocket(auraUrl(voiceId), ['token', token]);
       aura.binaryType = 'arraybuffer';
       aura.onmessage = (event) => {
         if (typeof event.data === 'string') {
@@ -330,8 +334,8 @@ export function useVoiceIntake(questionnaire: Questionnaire): UseVoiceIntake {
     setVoiceError(undefined);
     setStatus('connecting');
     try {
-      const token = await getToken();
-      await openSockets(token);
+      const { token, voiceId } = await getToken();
+      await openSockets(token, voiceId);
       voiceActiveRef.current = true;
       if (!startedRef.current) {
         startedRef.current = true;
